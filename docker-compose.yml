@@ -1,0 +1,15 @@
+services:
+  geocalib:
+    build:
+      context: .
+    ports:
+      - "7860:7860"
+    environment:
+      TORCH_HOME: /root/.cache/torch
+      GRADIO_SERVER_NAME: 0.0.0.0
+      GRADIO_SERVER_PORT: 7860
+    volumes:
+      - torch-cache:/root/.cache/torch
+
+volumes:
+  torch-cache:

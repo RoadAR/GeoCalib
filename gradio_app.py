@@ -1,12 +1,25 @@
 """Gradio app for GeoCalib inference."""
 
+import os
 from copy import deepcopy
 from time import time
 
 import gradio as gr
 import numpy as np
-import spaces
 import torch
+
+try:
+    import spaces
+except ImportError:
+    class _SpacesFallback:
+        @staticmethod
+        def GPU(duration=None):
+            def decorator(fn):
+                return fn
+
+            return decorator
+
+    spaces = _SpacesFallback()
 
 from geocalib import logger, viz2d
 from geocalib.camera import camera_models
@@ -60,18 +73,33 @@ model = GeoCalib().to(device)
 def format_output(results):
     camera, gravity = results["camera"], results["gravity"]
     vfov = rad2deg(camera.vfov)
+    hfov = rad2deg(camera.hfov)
     roll, pitch = rad2deg(gravity.rp).unbind(-1)
 
-    txt = "Estimated parameters:\n"
-    txt += f"Roll:  {roll.item():.2f}° (± {rad2deg(results['roll_uncertainty']).item():.2f})°\n"
-    txt += f"Pitch: {pitch.item():.2f}° (± {rad2deg(results['pitch_uncertainty']).item():.2f})°\n"
-    txt += f"vFoV:  {vfov.item():.2f}° (± {rad2deg(results['vfov_uncertainty']).item():.2f})°\n"
-    txt += (
-        f"Focal: {camera.f[0, 1].item():.2f} px (± {results['focal_uncertainty'].item():.2f} px)\n"
-    )
+    output = {
+        "camera_model": camera.name(),
+        "width_px": round(camera.size[0, 0].item(), 2),
+        "height_px": round(camera.size[0, 1].item(), 2),
+        "fx_px": round(camera.f[0, 0].item(), 2),
+        "fy_px": round(camera.f[0, 1].item(), 2),
+        "cx_px": round(camera.c[0, 0].item(), 2),
+        "cy_px": round(camera.c[0, 1].item(), 2),
+        "roll_deg": round(roll.item(), 2),
+        "roll_deg_uncertainty": round(rad2deg(results["roll_uncertainty"]).item(), 2),
+        "pitch_deg": round(pitch.item(), 2),
+        "pitch_deg_uncertainty": round(rad2deg(results["pitch_uncertainty"]).item(), 2),
+        "gravity_vector": [round(v, 6) for v in gravity.vec3d[0].tolist()],
+        "hfov_deg": round(hfov.item(), 2),
+        "vfov_deg": round(vfov.item(), 2),
+        "vfov_deg_uncertainty": round(rad2deg(results["vfov_uncertainty"]).item(), 2),
+        "focal_px": round(camera.f[0, 1].item(), 2),
+        "focal_px_uncertainty": round(results["focal_uncertainty"].item(), 2),
+    }
     if hasattr(camera, "k1"):
-        txt += f"K1:    {camera.k1[0].item():.2f}\n"
-    return txt
+        output["k1"] = round(camera.k1[0].item(), 4)
+    if hasattr(camera, "k2"):
+        output["k2"] = round(camera.k2[0].item(), 4)
+    return output
 
 
 @spaces.GPU(duration=10)
@@ -108,7 +136,7 @@ def process_results(
     inference_result["image"] = img.cpu()
 
     if inference_result is None:
-        return ("", np.ones((128, 256, 3)), None)
+        return ({}, np.ones((128, 256, 3)), None)
 
     plot_img = update_plot(
         inference_result,
@@ -201,7 +229,7 @@ with gr.Blocks() as demo:
                 plot_latitude_confidence = gr.Checkbox(label="latitude confidence", value=False)
 
             gr.Markdown("### Calibration Results")
-            text_output = gr.Textbox(label="Estimated parameters", type="text", lines=5)
+            text_output = gr.JSON(label="Estimated parameters")
 
     # Define the action when the button is clicked
     inference_state = gr.State()
@@ -228,4 +256,7 @@ with gr.Blocks() as demo:
 
 
 # Launch the app
-demo.launch()
+demo.launch(
+    server_name=os.getenv("GRADIO_SERVER_NAME", "0.0.0.0"),
+    server_port=int(os.getenv("GRADIO_SERVER_PORT", os.getenv("PORT", "7860"))),
+)

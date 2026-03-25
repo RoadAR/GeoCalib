@@ -47,6 +47,23 @@ python -m pip install -e .
 python -m pip install -e "git+https://github.com/cvg/GeoCalib#egg=geocalib"
 ```
 
+### Run with Docker
+
+Build and start the Gradio demo locally:
+
+```bash
+docker compose up --build
+```
+
+Then open `http://localhost:7860`.
+
+If you prefer plain Docker:
+
+```bash
+docker build -t geocalib .
+docker run --rm -p 7860:7860 -v geocalib-torch-cache:/root/.cache/torch geocalib
+```
+
 Here is a minimal usage example:
 
 ```python
@@ -651,4 +668,3 @@ If you use any ideas from the paper or code from this repo, please consider citi
 ## License
 
 The code is provided under the [Apache-2.0 License](LICENSE) while the weights of the trained model are provided under the [Creative Commons Attribution 4.0 International Public License](https://creativecommons.org/licenses/by/4.0/legalcode). Thanks to the authors of the [Laval Indoor HDR dataset](http://hdrdb.com/indoor/#presentation) for allowing this.
-

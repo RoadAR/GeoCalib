@@ -1,8 +1,10 @@
 import argparse
+from collections import deque
 import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from time import time
 
 import cv2
@@ -28,6 +30,7 @@ the calibration results.
 
 Arguments:
 - '--camera_id': Camera ID to use. If none, will ask for ip of droidcam (https://droidcam.app)
+- '--image_dir': Directory with image frames to use instead of a live camera
 
 You can toggle different features using the following keys:
 
@@ -76,6 +79,67 @@ class VideoCapture:
 
     def isOpened(self):
         return self.cap.isOpened()
+
+
+class ImageDirectoryCapture:
+    def __init__(self, image_dir, loop=True):
+        self.image_dir = Path(image_dir)
+        self.loop = loop
+        self.index = 0
+        patterns = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.webp")
+        self.files = sorted(path for pattern in patterns for path in self.image_dir.glob(pattern))
+
+    def read(self):
+        if not self.files:
+            return False, None
+
+        if self.index >= len(self.files):
+            if not self.loop:
+                return False, None
+            self.index = 0
+
+        frame = cv2.imread(str(self.files[self.index]))
+        self.index += 1
+        return frame is not None, frame
+
+    def isOpened(self):
+        return bool(self.files)
+
+
+class TemporalSmoother:
+    def __init__(self, window_size):
+        self.window_size = max(int(window_size), 1)
+        self.camera_history = deque(maxlen=self.window_size)
+        self.gravity_history = deque(maxlen=self.window_size)
+        self.scalar_history = {
+            "vfov_uncertainty": deque(maxlen=self.window_size),
+            "focal_uncertainty": deque(maxlen=self.window_size),
+            "roll_uncertainty": deque(maxlen=self.window_size),
+            "pitch_uncertainty": deque(maxlen=self.window_size),
+        }
+
+    def apply(self, calibration):
+        if self.window_size <= 1:
+            return calibration
+
+        self.camera_history.append(calibration["camera"]._data.detach().clone())
+        self.gravity_history.append(calibration["gravity"].vec3d.detach().clone())
+        for key, history in self.scalar_history.items():
+            if key in calibration:
+                history.append(calibration[key].detach().clone())
+
+        smoothed = dict(calibration)
+        camera_data = torch.stack(list(self.camera_history), dim=0).mean(dim=0)
+        gravity_vec = torch.stack(list(self.gravity_history), dim=0).mean(dim=0)
+
+        smoothed["camera"] = calibration["camera"].__class__(camera_data)
+        smoothed["gravity"] = calibration["gravity"].__class__(gravity_vec)
+
+        for key, history in self.scalar_history.items():
+            if history:
+                smoothed[key] = torch.stack(list(history), dim=0).mean(dim=0)
+
+        return smoothed
 
 
 def add_text(frame, text, align_left=True, align_top=True):
@@ -239,7 +303,7 @@ def plot_grid(frame, gravity, camera, grid_size=0.2, num_points=5):
 
     samples = np.linspace(-grid_size, grid_size, num_points)
     xz = np.meshgrid(samples, samples)
-    pts = np.stack((xz[0].ravel(), np.zeros_like(xz[0].ravel()), xz[1].ravel()), axis=-1)
+    pts = np.stack((xz[0].ravel(), np.full_like(xz[0].ravel(), 0.3), xz[1].ravel()), axis=-1)
 
     # project points
     rotation_vec = cv2.Rodrigues(gravity.R.numpy()[0])[0]
@@ -286,11 +350,13 @@ def undistort_image(img, camera, padding=0.3):
 
 
 class InteractiveDemo:
-    def __init__(self, capture: VideoCapture, device: str) -> None:
+    def __init__(self, capture, device: str, average_frames: int = 1) -> None:
         self.cap = capture
 
         self.device = torch.device(device)
         self.model = GeoCalib().to(device)
+        self.average_frames = max(int(average_frames), 1)
+        self.smoother = TemporalSmoother(self.average_frames)
 
         self.up_toggle = False
         self.lat_toggle = False
@@ -346,6 +412,8 @@ class InteractiveDemo:
         pitch_unc = rad2deg(calibration["pitch_uncertainty"].item())
 
         text = f"{self.camera_model.replace('_', ' ').title()}\n"
+        if self.average_frames > 1:
+            text += f"Avg window: {self.average_frames}\n"
         text += f"Roll:  {roll:.2f} (+- {roll_unc:.2f})\n"
         text += f"Pitch: {pitch:.2f} (+- {pitch_unc:.2f})\n"
         text += f"vFoV:  {vfov:.2f} (+- {fov_unc:.2f})\n"
@@ -401,6 +469,7 @@ class InteractiveDemo:
             img = torch.tensor(img).permute(2, 0, 1) / 255.0
 
             calibration = self.model.calibrate(img.to(self.device), camera_model=self.camera_model)
+            calibration = self.smoother.apply(calibration)
 
             # render results to the frame
             frame = self.render_frame(frame, calibration)
@@ -425,6 +494,18 @@ def main():
         default=None,
         help="Camera ID to use. If none, will ask for ip of droidcam.",
     )
+    parser.add_argument(
+        "--image_dir",
+        type=Path,
+        default=None,
+        help="Directory with image frames to replay instead of using a live camera.",
+    )
+    parser.add_argument(
+        "--average_frames",
+        type=int,
+        default=1,
+        help="Moving average window for camera/gravity parameters across consecutive frames.",
+    )
     args = parser.parse_args()
 
     print(description)
@@ -433,16 +514,18 @@ def main():
     print(f"Running on: {device}")
 
     # setup video capture
-    if args.camera_id is not None:
+    if args.image_dir is not None:
+        cap = ImageDirectoryCapture(args.image_dir)
+    elif args.camera_id is not None:
         cap = VideoCapture(args.camera_id)
     else:
         ip = input("Enter the IP address of the camera: ")
         cap = VideoCapture(f"http://{ip}:4747/video/force/1920x1080")
 
     if not cap.isOpened():
-        raise ValueError("Error: Could not open camera.")
+        raise ValueError("Error: Could not open camera or image directory.")
 
-    demo = InteractiveDemo(cap, device)
+    demo = InteractiveDemo(cap, device, average_frames=args.average_frames)
     demo.run()
 
 
